@@ -1,19 +1,19 @@
 use chrono::prelude::*;
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    event::{self, Event as CEvent, KeyCode, KeyEvent},
+    terminal,
 };
 use rand::{distributions::Alphanumeric, prelude::*};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, io::Stdout, sync::mpsc::Receiver};
 use thiserror::Error;
 use tui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{
@@ -21,6 +21,38 @@ use tui::{
     },
     Terminal,
 };
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    terminal::enable_raw_mode().expect("can run in raw mode");
+
+    let (tx, mut rx) = mpsc::channel();
+    thread::spawn(move || accept_user_input(Duration::from_millis(200), tx));
+    let mut app_state = AppState::default();
+    let mut terminal = create_terminal()?;
+
+    loop {
+        terminal.draw(|rect| {
+            draw(
+                rect,
+                &app_state.menu_titles,
+                app_state.active_menu_item,
+                &mut app_state.pet_list_state,
+            );
+        })?;
+
+        let input_response = handle_user_input(
+            &mut rx,
+            &mut terminal,
+            &mut app_state.active_menu_item,
+            &mut app_state.pet_list_state,
+        )?;
+        if input_response == ResponseToUserInput::Stop {
+            break;
+        }
+    }
+
+    Ok(())
+}
 
 const DB_PATH: &str = "./data/db.json";
 
@@ -61,152 +93,218 @@ impl From<MenuItem> for usize {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    enable_raw_mode().expect("can run in raw mode");
+struct AppState<'a> {
+    menu_titles: Vec<&'a str>,
+    active_menu_item: MenuItem,
+    pet_list_state: ListState,
+}
 
-    let (tx, rx) = mpsc::channel();
-    let tick_rate = Duration::from_millis(200);
-    thread::spawn(move || {
-        let mut last_tick = Instant::now();
-        loop {
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
+impl Default for AppState<'_> {
+    fn default() -> Self {
+        let mut pet_list_state = ListState::default();
+        pet_list_state.select(Some(0));
+        Self {
+            menu_titles: vec!["Home", "Pets", "Add", "Delete", "Quit"],
+            active_menu_item: MenuItem::Home,
+            pet_list_state,
+        }
+    }
+}
 
-            if event::poll(timeout).expect("poll works") {
-                if let CEvent::Key(key) = event::read().expect("can read events") {
-                    tx.send(Event::Input(key)).expect("can send events");
-                }
-            }
+#[derive(PartialEq)]
+enum ResponseToUserInput {
+    Continue,
+    Stop,
+}
 
-            if last_tick.elapsed() >= tick_rate {
-                if let Ok(_) = tx.send(Event::Tick) {
-                    last_tick = Instant::now();
+fn handle_user_input(
+    rx: &mut Receiver<Event<KeyEvent>>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    active_menu_item: &mut MenuItem,
+    pet_list_state: &mut ListState,
+) -> Result<ResponseToUserInput, Box<dyn std::error::Error>> {
+    let Event::Input(event) = rx.recv()? else {
+        return Ok(ResponseToUserInput::Continue);
+    };
+    match event.code {
+        KeyCode::Char('q') => {
+            terminal::disable_raw_mode()?;
+            terminal.show_cursor()?;
+            return Ok(ResponseToUserInput::Stop);
+        }
+        KeyCode::Char('h') => *active_menu_item = MenuItem::Home,
+        KeyCode::Char('p') => *active_menu_item = MenuItem::Pets,
+        KeyCode::Char('a') => {
+            add_random_pet_to_db().expect("can add new random pet");
+        }
+        KeyCode::Char('d') => {
+            remove_pet_at_index(pet_list_state).expect("can remove pet");
+        }
+        KeyCode::Char('j') => {
+            if let Some(selected) = pet_list_state.selected() {
+                let amount_pets = read_db().expect("can fetch pet list").len();
+                if selected >= amount_pets - 1 {
+                    pet_list_state.select(Some(0));
+                } else {
+                    pet_list_state.select(Some(selected + 1));
                 }
             }
         }
-    });
+        KeyCode::Char('k') => {
+            if let Some(selected) = pet_list_state.selected() {
+                let amount_pets = read_db().expect("can fetch pet list").len();
+                if selected > 0 {
+                    pet_list_state.select(Some(selected - 1));
+                } else {
+                    pet_list_state.select(Some(amount_pets - 1));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(ResponseToUserInput::Continue)
+}
 
+fn create_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    Ok(terminal)
+}
 
-    let menu_titles = vec!["Home", "Pets", "Add", "Delete", "Quit"];
-    let mut active_menu_item = MenuItem::Home;
-    let mut pet_list_state = ListState::default();
-    pet_list_state.select(Some(0));
-
+fn accept_user_input(tick_rate: Duration, tx: mpsc::Sender<Event<KeyEvent>>) {
+    let mut last_tick = Instant::now();
     loop {
-        terminal.draw(|rect| {
-            let size = rect.size();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(2)
-                .constraints(
-                    [
-                        Constraint::Length(3),
-                        Constraint::Min(2),
-                        Constraint::Length(3),
-                    ]
-                    .as_ref(),
-                )
-                .split(size);
+        let timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| Duration::from_secs(0));
 
-            let copyright = Paragraph::new("pet-CLI 2020 - all rights reserved")
-                .style(Style::default().fg(Color::LightCyan))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .style(Style::default().fg(Color::White))
-                        .title("Copyright")
-                        .border_type(BorderType::Plain),
-                );
-
-            let menu = menu_titles
-                .iter()
-                .map(|t| {
-                    let (first, rest) = t.split_at(1);
-                    Spans::from(vec![
-                        Span::styled(
-                            first,
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::UNDERLINED),
-                        ),
-                        Span::styled(rest, Style::default().fg(Color::White)),
-                    ])
-                })
-                .collect();
-
-            let tabs = Tabs::new(menu)
-                .select(active_menu_item.into())
-                .block(Block::default().title("Menu").borders(Borders::ALL))
-                .style(Style::default().fg(Color::White))
-                .highlight_style(Style::default().fg(Color::Yellow))
-                .divider(Span::raw("|"));
-
-            rect.render_widget(tabs, chunks[0]);
-            match active_menu_item {
-                MenuItem::Home => rect.render_widget(render_home(), chunks[1]),
-                MenuItem::Pets => {
-                    let pets_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints(
-                            [Constraint::Percentage(20), Constraint::Percentage(80)].as_ref(),
-                        )
-                        .split(chunks[1]);
-                    let (left, right) = render_pets(&pet_list_state);
-                    rect.render_stateful_widget(left, pets_chunks[0], &mut pet_list_state);
-                    rect.render_widget(right, pets_chunks[1]);
-                }
+        if event::poll(timeout).expect("poll works") {
+            if let CEvent::Key(key) = event::read().expect("can read events") {
+                tx.send(Event::Input(key)).expect("can send events");
             }
-            rect.render_widget(copyright, chunks[2]);
-        })?;
+        }
 
-        match rx.recv()? {
-            Event::Input(event) => match event.code {
-                KeyCode::Char('q') => {
-                    disable_raw_mode()?;
-                    terminal.show_cursor()?;
-                    break;
-                }
-                KeyCode::Char('h') => active_menu_item = MenuItem::Home,
-                KeyCode::Char('p') => active_menu_item = MenuItem::Pets,
-                KeyCode::Char('a') => {
-                    add_random_pet_to_db().expect("can add new random pet");
-                }
-                KeyCode::Char('d') => {
-                    remove_pet_at_index(&mut pet_list_state).expect("can remove pet");
-                }
-                KeyCode::Down => {
-                    if let Some(selected) = pet_list_state.selected() {
-                        let amount_pets = read_db().expect("can fetch pet list").len();
-                        if selected >= amount_pets - 1 {
-                            pet_list_state.select(Some(0));
-                        } else {
-                            pet_list_state.select(Some(selected + 1));
-                        }
-                    }
-                }
-                KeyCode::Up => {
-                    if let Some(selected) = pet_list_state.selected() {
-                        let amount_pets = read_db().expect("can fetch pet list").len();
-                        if selected > 0 {
-                            pet_list_state.select(Some(selected - 1));
-                        } else {
-                            pet_list_state.select(Some(amount_pets - 1));
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::Tick => {}
+        if last_tick.elapsed() >= tick_rate && tx.send(Event::Tick).is_ok() {
+            last_tick = Instant::now();
         }
     }
+}
 
-    Ok(())
+fn draw(
+    total_drawing_rect: &mut tui::Frame<CrosstermBackend<io::Stdout>>,
+    menu_titles: &[&str],
+    active_menu_item: MenuItem,
+    pet_list_state: &mut ListState,
+) {
+    let app_rects = create_app_rects(total_drawing_rect.size());
+    let copyright = create_copyright_paragraph();
+    let tabs = create_tabs(create_menu(menu_titles), active_menu_item);
+    total_drawing_rect.render_widget(tabs, app_rects.menu);
+    render_selected_widget(
+        active_menu_item,
+        total_drawing_rect,
+        &app_rects,
+        pet_list_state,
+    );
+    total_drawing_rect.render_widget(copyright, app_rects.copyright);
+}
+
+fn render_selected_widget(
+    active_menu_item: MenuItem,
+    rect: &mut tui::Frame<CrosstermBackend<io::Stdout>>,
+    app_rects: &AppRects,
+    pet_list_state: &mut ListState,
+) {
+    match active_menu_item {
+        MenuItem::Home => rect.render_widget(render_home(), app_rects.main_widget),
+        MenuItem::Pets => {
+            let pet_rects = create_pet_rects(&app_rects.main_widget);
+            let (left, right) = create_pet_widgets(pet_list_state);
+            rect.render_stateful_widget(left, pet_rects.names, pet_list_state);
+            rect.render_widget(right, pet_rects.details);
+        }
+    }
+}
+
+struct PetRects {
+    names: Rect,
+    details: Rect,
+}
+
+fn create_pet_rects(parent_rect: &Rect) -> PetRects {
+    let pet_rects = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
+        .split(*parent_rect);
+    PetRects {
+        names: pet_rects[0],
+        details: pet_rects[1],
+    }
+}
+
+fn create_tabs<'a>(menu: Vec<Spans<'a>>, active_menu_item: MenuItem) -> Tabs<'a> {
+    Tabs::new(menu)
+        .select(active_menu_item.into())
+        .block(Block::default().title("Menu").borders(Borders::ALL))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(Style::default().fg(Color::Yellow))
+        .divider(Span::raw("|"))
+}
+
+struct AppRects {
+    menu: Rect,
+    main_widget: Rect,
+    copyright: Rect,
+}
+
+fn create_app_rects(total_drawing_rect: Rect) -> AppRects {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints(vec![
+            Constraint::Length(3),
+            Constraint::Min(2),
+            Constraint::Length(3),
+        ])
+        .split(total_drawing_rect);
+    AppRects {
+        menu: areas[0],
+        main_widget: areas[1],
+        copyright: areas[2],
+    }
+}
+
+fn create_menu<'a>(menu_titles: &[&'a str]) -> Vec<Spans<'a>> {
+    menu_titles
+        .iter()
+        .map(|t| {
+            let (first, rest) = t.split_at(1);
+            Spans::from(vec![
+                Span::styled(
+                    first,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::styled(rest, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect()
+}
+
+fn create_copyright_paragraph<'a>() -> Paragraph<'a> {
+    Paragraph::new("pet-CLI 2020 - all rights reserved")
+        .style(Style::default().fg(Color::LightCyan))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::White))
+                .title("Copyright")
+                .border_type(BorderType::Plain),
+        )
 }
 
 fn render_home<'a>() -> Paragraph<'a> {
@@ -234,7 +332,7 @@ fn render_home<'a>() -> Paragraph<'a> {
     home
 }
 
-fn render_pets<'a>(pet_list_state: &ListState) -> (List<'a>, Table<'a>) {
+fn create_pet_widgets<'a>(pet_list_state: &ListState) -> (List<'a>, Table<'a>) {
     let pets = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().fg(Color::White))
@@ -339,22 +437,22 @@ fn add_random_pet_to_db() -> Result<Vec<Pet>, Error> {
     };
 
     parsed.push(random_pet);
-    fs::write(DB_PATH, &serde_json::to_vec(&parsed)?)?;
+    fs::write(DB_PATH, serde_json::to_vec(&parsed)?)?;
     Ok(parsed)
 }
 
 fn remove_pet_at_index(pet_list_state: &mut ListState) -> Result<(), Error> {
-    if let Some(selected) = pet_list_state.selected() {
-        let db_content = fs::read_to_string(DB_PATH)?;
-        let mut parsed: Vec<Pet> = serde_json::from_str(&db_content)?;
-        parsed.remove(selected);
-        fs::write(DB_PATH, &serde_json::to_vec(&parsed)?)?;
-        let amount_pets = read_db().expect("can fetch pet list").len();
-        if selected > 0 {
-            pet_list_state.select(Some(selected - 1));
-        } else {
-            pet_list_state.select(Some(0));
-        }
+    let Some(selected) = pet_list_state.selected() else {
+        return Ok(());
+    };
+    let db_content = fs::read_to_string(DB_PATH)?;
+    let mut parsed: Vec<Pet> = serde_json::from_str(&db_content)?;
+    parsed.remove(selected);
+    fs::write(DB_PATH, serde_json::to_vec(&parsed)?)?;
+    if selected > 0 {
+        pet_list_state.select(Some(selected - 1));
+    } else {
+        pet_list_state.select(Some(0));
     }
     Ok(())
 }
